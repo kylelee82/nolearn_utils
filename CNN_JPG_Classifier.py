@@ -20,6 +20,7 @@ from lasagne.updates import adadelta
 from lasagne.updates import sgd
 from lasagne.updates import adam
 from lasagne.nonlinearities import softmax
+from lasagne.objectives import categorical_crossentropy
 from nolearn.lasagne import NeuralNet
 from nolearn.lasagne import BatchIterator
 from nolearn.lasagne import TrainSplit
@@ -53,6 +54,8 @@ from lasagne.layers import ElemwiseSumLayer
 from lasagne.layers import Conv2DLayer as ConvLayer
 from lasagne.layers import DropoutLayer
 from lasagne.layers import Upscale2DLayer
+from lasagne.layers import BatchNormLayer
+from lasagne.layers import Pool2DLayer as PoolLayer
 import re
 from skimage.transform import resize
 from skimage.transform import SimilarityTransform
@@ -61,6 +64,8 @@ from skimage.transform import AffineTransform
 from skimage.transform._warps_cy import _warp_fast
 from lasagne.nonlinearities import sigmoid
 import theano.tensor as T
+from sklearn.cross_validation import KFold
+from sklearn.cross_validation import StratifiedKFold
 
 class CNN_JPG_Classifier:
 
@@ -660,6 +665,155 @@ class CNN_JPG_Classifier:
             print("Info: Number of samples in current chunk:"+str(nsamples))            
 
             targets  = np.zeros(shape=(nsamples*multiplier,self.img_height,self.img_width)) # only at the section of interest
+            i=0
+            chunk_cnt += 1 # increment chunk count           
+        if accumulated_samples == total_samples:
+            print("OK: Total samples = "+str(total_samples)+", Accumulated samples = "+str(accumulated_samples))
+        else:
+            print("WARNING: Total samples = "+str(total_samples)+", Accumulated samples = "+str(accumulated_samples)+" - mismatch noted!")
+
+    # training - read all and save to npy files
+    # validation splits are saved as a different name and never invoked during AllImageIterator type of scenarios
+    def read_train_dirs_all_valsplit(self,pics_dir=list(),val_imgs=list(),all_class_represented=True,output_dir="./",type="jpg",blur=True):
+        # for multi-class support
+        pics_dir_len = 0
+        pics_dir_pics_listoflist = [list()] * self.num_class
+        if self.num_class > 0:
+            for i in range(0,self.num_class):
+                print("Class:"+pics_dir[i])
+                pics_dir_pics_listoflist[i].append(list(glob.iglob(pics_dir[i]+"/*."+type)))
+                pics_dir_len += len(list(glob.iglob(pics_dir[i]+"/*."+type)))
+        multiplier = 1
+        total_samples = pics_dir_len
+        nsamples = min(min(pics_dir_len,ceil((self.num_class) * self.n_train_max/self.num_class)),self.n_train_max)
+        print("Info: Number of samples in current chunk:"+str(nsamples))            
+        if self.grayscale is True:
+            inputs  = np.zeros(shape=(nsamples*multiplier,self.img_height,self.img_width)) # only at the section of interest
+        else:
+            inputs  = np.zeros(shape=(nsamples*multiplier,3,self.img_height,self.img_width)) # RGB
+        targets = np.zeros(shape=(nsamples*multiplier,)) # vector only
+        i=0
+        chunk_cnt = 0
+        accumulated_samples = 0
+        dont_save_next = 0 
+        while nsamples != 0:
+            new_pics_dir_len = 0
+            new_pics_dir_listoflist = [list()] * self.num_class
+            if self.num_class > 0:
+                k=0
+    	        val_pics_idx = list()
+		train_pics_idx = list()
+                for pics_dir_pics_list in pics_dir_pics_listoflist[k]:
+                    class_pics_list = list()
+                    for pic in pics_dir_pics_list:
+			flbase = os.path.basename(pic)
+                        if i < multiplier * (k+1) * self.n_train_max / self.num_class:
+                            if self.verbose == True:
+                                print("Info: Chunk "+str(chunk_cnt)+": Reading (training) class:"+str(k)+", pic "+str(i)+":"+str(pic))
+                            img = misc.imread(pic)
+			    if flbase in val_imgs:
+				val_pics_idx.append(i)
+			    else:
+				train_pics_idx.append(i)
+                            if self.grayscale is True:
+                                if img.shape == (self.img_width, self.img_height):
+                                    inputs[i,:,:] = img[:,:]
+                                else:
+				    if blur is True:
+	                                img_blur = ndimage.gaussian_filter(img,sigma=0.1)
+				    else:
+					img_blur = img    
+                                    if self.zoom_mode is True:
+                                        inputs[i,:,:] = self.resize_image(self.rgb2gray(img_blur[self.img_y1:self.img_y2,self.img_x1:self.img_x2]))
+                                    else:
+	                                inputs[i,:,:] = self.resize_image(self.rgb2gray(img_blur))
+                            else:
+                                img_blur = img
+                                if self.zoom_mode is True:
+                                    inputs[i,0,:,:] = self.resize_image(img_blur[self.img_y1:self.img_y2,self.img_x1:self.img_x2,0])
+                                    inputs[i,1,:,:] = self.resize_image(img_blur[self.img_y1:self.img_y2,self.img_x1:self.img_x2,1])
+                                    inputs[i,2,:,:] = self.resize_image(img_blur[self.img_y1:self.img_y2,self.img_x1:self.img_x2,2])
+                                else:
+                                    inputs[i,0,:,:] = self.resize_image(img_blur[:,:,0])
+                                    inputs[i,1,:,:] = self.resize_image(img_blur[:,:,1])
+                                    inputs[i,2,:,:] = self.resize_image(img_blur[:,:,2])
+                            targets[i] = k
+                            i+=1 # inc index per class
+                            accumulated_samples += 1
+                        else:
+                            # save for next iteration since it was not read this time
+                            class_pics_list.append(pic)
+                    if len(class_pics_list) > 0:
+                        new_pics_dir_listoflist[k].append(class_pics_list)
+                        new_pics_dir_len += len(class_pics_list)
+                    else:
+                        if all_class_represented is True:
+                            dont_save_next = 1
+                            #print("INFO: Skip saving next round!")
+                        new_pics_dir_listoflist[k].append(list())
+                    k+=1 # inc class
+                    
+            if self.pretrain_model is True:
+		# requirements for pretraining
+		# change from RGB to BGR (misc.imread is RGB)
+		if self.pretrain_name is not "inception":
+			inputs = inputs[:,::-1,:,:]
+			if self.grayscale is False:
+				inputs = inputs - self.IMAGE_MEAN
+			else:
+				inputs = inputs - self.rgb2gray(self.IMAGE_MEAN)
+		else:
+			# inceptions uses RGB
+			# scale to -1, 1
+			inputs = (inputs - 128.0000) / 128.0000
+            else:
+	        inputs = (inputs / 255.0000) - 0.5
+
+
+            self.X_train = inputs[train_pics_idx]
+            self.Y_train = targets[train_pics_idx]
+	    self.X_cv = inputs[val_pics_idx]
+	    self.Y_cv = targets[val_pics_idx]
+
+            # save the values too
+            np.save(output_dir+"train_data_inputs."+str(chunk_cnt)+".cache",inputs[train_pics_idx])
+            np.save(output_dir+"train_data_targets."+str(chunk_cnt)+".cache",targets[train_pics_idx])
+            print("Info: Saved X_train model to "+output_dir+"train_data_inputs."+str(chunk_cnt)+".cache")
+            print("Info: Saved Y_train model to "+output_dir+"train_data_targets."+str(chunk_cnt)+".cache")
+                
+	    if len(inputs[val_pics_idx]) > 0:
+	            np.save(output_dir+"val_data_inputs."+str(chunk_cnt)+".cache",inputs[val_pics_idx])
+	            np.save(output_dir+"val_data_targets."+str(chunk_cnt)+".cache",targets[val_pics_idx])
+	            print("Info: Saved X_cv model to "+output_dir+"val_data_inputs."+str(chunk_cnt)+".cache")
+	            print("Info: Saved Y_cv model to "+output_dir+"val_data_targets."+str(chunk_cnt)+".cache")
+		    print("Info: Train split = {}".format(len(inputs[train_pics_idx])))
+		    print("Info: Validation split = {}".format(len(inputs[val_pics_idx])))
+
+            # recalculate nsamples and reassign list
+            pics_dir_len = new_pics_dir_len
+            pics_dir_pics_listoflist = new_pics_dir_listoflist
+            if i != nsamples:
+                print("ERROR: Iteration does not match number of samples! Will cause issues if this is not fixed...")
+                sys.exit(999)
+
+            if dont_save_next == 1:
+                break
+            # recalculate numpy array size
+            nsamples=0
+            i=0
+            k=0
+            for pics_dir_pics_list in pics_dir_pics_listoflist[k]:
+                for pic in pics_dir_pics_list:
+                    if i < multiplier * (k+1) * self.n_train_max / self.num_class:
+                        nsamples += 1
+                        i+=1
+                k+=1
+            print("Info: Number of samples in current chunk:"+str(nsamples))            
+            if self.grayscale is True:
+                inputs  = np.zeros(shape=(nsamples*multiplier,self.img_height,self.img_width)) # only at the section of interest
+            else:
+                inputs  = np.zeros(shape=(nsamples*multiplier,3,self.img_height,self.img_width)) # RGB
+            targets = np.zeros(shape=(nsamples*multiplier,)) # vector only
             i=0
             chunk_cnt += 1 # increment chunk count           
         if accumulated_samples == total_samples:
@@ -1828,18 +1982,22 @@ class CNN_JPG_Classifier:
 		layers = inception_v3,
                 #optimization parameters:
                 update = sgd,
-                update_learning_rate = theano.shared(float32(0.05)),
-                regression = True,
-                max_epochs = 100,
+                update_learning_rate = theano.shared(float32(0.001)),
+                regression = False,
+		objective_loss_function=categorical_crossentropy,		
+                max_epochs = 1000,
                 verbose = 10,
+		train_split=DriverTestSplit(max_test_split=2500, cache_dir="./data/kaggle/statefarm/inception_cache/"),
                 # this code implements variable learning rate (start at 0.0005 ends at 0.00005)
                 on_epoch_finished=[
-                    AdjustVariable('update_learning_rate',start=0.05, stop=0.01),
+		    EarlyStopping(patience=100),
+                    AdjustVariable('update_learning_rate',start=0.001, stop=0.0001),
                 ],
                 #batch_iterator_train=BatchIterator(batch_size=16,shuffle=True)
-		batch_iterator_train=AllImageIterator(batch_size=16,
-						      cache_dir="./kaggle/statefarm/inception_cache/",
-						      augment=False)
+                batch_iterator_train=SingleCacheIterator(batch_size=32,
+                                                         cache_dir="./data/kaggle/statefarm/inception_cache/",
+							 regression=False,
+                                                         augment=False)
                 )
         self.classifier.initialize()
         layers_info = PrintLayerInfo()
@@ -1900,23 +2058,29 @@ class CNN_JPG_Classifier:
     # resnet-50
     def define_cnn_resnet50(self):
         # generate all layers using lasagne style, and pass into nolearn wrapper
-        resnet = self.build_resnet50_101_152(layer_cnt=50)
+        resnet = self.build_resnet50_model()
+	#resnet = self.build_resnet50_101_152(layer_cnt=50)
 
         self.classifier = NeuralNet(
                 layers = resnet,
                 #optimization parameters:
-                update = nesterov_momentum,
-                update_learning_rate = theano.shared(float32(0.1)),
-                update_momentum = theano.shared(float32(0.9)),
-                regression = True,
-                max_epochs = 100,
+                update = sgd,
+                update_learning_rate = theano.shared(float32(0.001)),
+                regression = False,
+		objective_loss_function=categorical_crossentropy,
+                max_epochs = 1000,
                 verbose = 10,
+                train_split=DriverTestSplit(max_test_split=2500, cache_dir="./data/kaggle/statefarm/resnet50_cache/"),
                 # this code implements variable learning rate (start at 0.0005 ends at 0.00005)
                 on_epoch_finished=[
-                    AdjustVariable('update_learning_rate',start=0.1, stop=0.05),
-                    AdjustVariable('update_momentum', start=0.9, stop=0.9),
+                    EarlyStopping(patience=200),
+                    AdjustVariable('update_learning_rate',start=0.001, stop=0.0001),
                 ],
-                batch_iterator_train=BatchIterator(batch_size=16)
+                #batch_iterator_train=BatchIterator(batch_size=16,shuffle=True)
+                batch_iterator_train=SingleCacheIterator(batch_size=32,
+                                                         cache_dir="./data/kaggle/statefarm/resnet50_cache/",
+                                                         regression=False,
+                                                         augment=False)
                 )
         self.classifier.initialize()
         layers_info = PrintLayerInfo()
@@ -2232,8 +2396,8 @@ class CNN_JPG_Classifier:
         layers = self.inceptionE(layers, nfilt=((320,), (384, 384, 384), (448, 384, 384, 384), (192,)),pool_mode='average_exc_pad')
         layers = self.inceptionE(layers, nfilt=((320,), (384, 384, 384), (448, 384, 384, 384), (192,)),pool_mode='max')
         layers = GlobalPoolLayer(layers)
-	layers = DropoutLayer(layers, p=0.8)
-        layers = DenseLayer(layers, num_units=self.num_class, nonlinearity=None)
+	layers = DropoutLayer(layers, p=0.7)
+        layers = DenseLayer(layers, num_units=self.num_class, nonlinearity=softmax)
         return layers
 
     #### segmentation networks ####
@@ -2348,6 +2512,170 @@ class CNN_JPG_Classifier:
 	return l
 
     ##### resnet related layers #####
+    def build_simple_block(self,incoming_layer, names,
+        	           num_filters, filter_size, stride, pad,
+                       	   use_bias=False, nonlin=rectify):
+    	"""Creates stacked Lasagne layers ConvLayer -> BN -> (ReLu)
+    	Parameters:
+    	----------
+    	incoming_layer : instance of Lasagne layer
+        	Parent layer
+    	names : list of string
+        	Names of the layers in block
+    	num_filters : int
+        	Number of filters in convolution layer
+    	filter_size : int
+        	Size of filters in convolution layer
+    	stride : int
+        	Stride of convolution layer
+    	pad : int
+        	Padding of convolution layer
+    	use_bias : bool
+        	Whether to use bias in conlovution layer
+    	nonlin : function
+        	Nonlinearity type of Nonlinearity layer
+    	Returns
+    	-------
+    	tuple: (net, last_layer_name)
+        	net : dict
+            	Dictionary with stacked layers
+        	last_layer_name : string
+            	Last layer name
+    	"""
+    	net = []
+    	net.append((
+            	names[0],
+            	ConvLayer(incoming_layer, num_filters, filter_size, pad, stride,
+                      	  flip_filters=False, nonlinearity=None) if use_bias
+            	else ConvLayer(incoming_layer, num_filters, filter_size, stride, pad, b=None,
+                               flip_filters=False, nonlinearity=None)
+        	))
+
+    	net.append((
+            	names[1],
+            	BatchNormLayer(net[-1][1])
+        	))
+    	if nonlin is not None:
+        	net.append((
+            		names[2],
+            		NonlinearityLayer(net[-1][1], nonlinearity=nonlin)
+        	))
+
+    	return dict(net), net[-1][0]
+
+
+    def build_residual_block(self, incoming_layer, ratio_n_filter=1.0, ratio_size=1.0, has_left_branch=False,
+                             upscale_factor=4, ix=''):
+    	"""Creates two-branch residual block
+    	Parameters:
+    	----------
+    	incoming_layer : instance of Lasagne layer
+        	Parent layer
+    	ratio_n_filter : float
+        	Scale factor of filter bank at the input of residual block
+    	ratio_size : float
+        	Scale factor of filter size
+    	has_left_branch : bool
+        	if True, then left branch contains simple block
+    	upscale_factor : float
+        	Scale factor of filter bank at the output of residual block
+    	ix : int
+        	Id of residual block
+    	Returns
+    	-------
+    	tuple: (net, last_layer_name)
+        	net : dict
+            	Dictionary with stacked layers
+        	last_layer_name : string
+            	Last layer name
+    	"""
+    	simple_block_name_pattern = ['res%s_branch%i%s', 'bn%s_branch%i%s', 'res%s_branch%i%s_relu']
+
+    	net = {}
+
+    	# right branch
+    	net_tmp, last_layer_name = self.build_simple_block(
+        	incoming_layer, map(lambda s: s % (ix, 2, 'a'), simple_block_name_pattern),
+        	int(lasagne.layers.get_output_shape(incoming_layer)[1]*ratio_n_filter), 1, int(1.0/ratio_size), 0)
+    	net.update(net_tmp)
+
+    	net_tmp, last_layer_name = self.build_simple_block(
+        	net[last_layer_name], map(lambda s: s % (ix, 2, 'b'), simple_block_name_pattern),
+        	lasagne.layers.get_output_shape(net[last_layer_name])[1], 3, 1, 1)
+    	net.update(net_tmp)
+
+    	net_tmp, last_layer_name = self.build_simple_block(
+        	net[last_layer_name], map(lambda s: s % (ix, 2, 'c'), simple_block_name_pattern),
+        	lasagne.layers.get_output_shape(net[last_layer_name])[1]*upscale_factor, 1, 1, 0,
+        	nonlin=None)
+    	net.update(net_tmp)
+
+    	right_tail = net[last_layer_name]
+    	left_tail = incoming_layer
+
+    	# left branch
+    	if has_left_branch:
+        	net_tmp, last_layer_name = self.build_simple_block(
+            		incoming_layer, map(lambda s: s % (ix, 1, ''), simple_block_name_pattern),
+            		int(lasagne.layers.get_output_shape(incoming_layer)[1]*4*ratio_n_filter), 1, int(1.0/ratio_size), 0,
+            		nonlin=None)
+        	net.update(net_tmp)
+        	left_tail = net[last_layer_name]
+
+    	net['res%s' % ix] = ElemwiseSumLayer([left_tail, right_tail], coeffs=1)
+    	net['res%s_relu' % ix] = NonlinearityLayer(net['res%s' % ix], nonlinearity=rectify)
+
+    	return net, 'res%s_relu' % ix
+
+    def build_resnet50_model(self):
+    	net = {}
+    	net['input'] = InputLayer((None, 3, 224, 224))
+    	sub_net, parent_layer_name = self.build_simple_block(
+        	net['input'], ['conv1', 'bn_conv1', 'conv1_relu'],
+        	64, 7, 3, 2, use_bias=True)
+    	net.update(sub_net)
+    	net['pool1'] = PoolLayer(net[parent_layer_name], pool_size=3, stride=2, pad=0, mode='max', ignore_border=False)
+    	block_size = list('abc')
+    	parent_layer_name = 'pool1'
+    	for c in block_size:
+        	if c == 'a':
+            		sub_net, parent_layer_name = self.build_residual_block(net[parent_layer_name], 1, 1, True, 4, ix='2%s' % c)
+        	else:
+            		sub_net, parent_layer_name = self.build_residual_block(net[parent_layer_name], 1.0/4, 1, False, 4, ix='2%s' % c)
+        	net.update(sub_net)
+
+    	block_size = list('abcd')
+    	for c in block_size:
+        	if c == 'a':
+            		sub_net, parent_layer_name = self.build_residual_block(
+                		net[parent_layer_name], 1.0/2, 1.0/2, True, 4, ix='3%s' % c)
+        	else:
+            		sub_net, parent_layer_name = self.build_residual_block(net[parent_layer_name], 1.0/4, 1, False, 4, ix='3%s' % c)
+        	net.update(sub_net)
+
+    	block_size = list('abcdef')
+    	for c in block_size:
+        	if c == 'a':
+            		sub_net, parent_layer_name = self.build_residual_block(
+                		net[parent_layer_name], 1.0/2, 1.0/2, True, 4, ix='4%s' % c)
+        	else:
+            		sub_net, parent_layer_name = self.build_residual_block(net[parent_layer_name], 1.0/4, 1, False, 4, ix='4%s' % c)
+        	net.update(sub_net)
+
+    	block_size = list('abc')
+    	for c in block_size:
+        	if c == 'a':
+            		sub_net, parent_layer_name = self.build_residual_block(
+                		net[parent_layer_name], 1.0/2, 1.0/2, True, 4, ix='5%s' % c)
+        	else:
+            		sub_net, parent_layer_name = self.build_residual_block(net[parent_layer_name], 1.0/4, 1, False, 4, ix='5%s' % c)
+        	net.update(sub_net)
+    	net['pool5'] = PoolLayer(net[parent_layer_name], pool_size=7, stride=1, pad=0,
+                             	mode='average_exc_pad', ignore_border=False)
+    	net['fc1000'] = DenseLayer(net['pool5'], num_units=self.num_class, nonlinearity=None)
+    	net['prob'] = NonlinearityLayer(net['fc1000'], nonlinearity=softmax)
+    	return net['prob']
+
     # expect input of 224x224
     def build_resnet34(self, input_var=None):    
         # create a residual learning building block with two stacked 3x3 convlayers as in paper
@@ -2533,6 +2861,7 @@ class AdjustVariable(object):
         epoch = train_history[-1]['epoch']
         new_value = float32(self.ls[epoch - 1])
         getattr(nn, self.name).set_value(new_value)
+	print('Info: Current learning rate for epoch = {}'.format(new_value))
 
 # this adjusts the learning rate by checking the train_loss for the past epoch_limit
 # if max-min/max < threshold, reduce learning rate by divisor
@@ -2581,7 +2910,7 @@ class AllImageIterator(BatchIterator):
 		self.y_target = np.load(cache_target).astype(float32)
 
 		# manipulate matrices so that it fits standard criteria
-		if grayscale is False:
+		if self.grayscale is False:
 			self.X = self.X.reshape(-1,3,np.size(self.X,2),np.size(self.X,3)).astype(float32)
 		else:
 			self.X = self.X.reshape(-1,1,np.size(self.X,1),np.size(self.X,2)).astype(float32)
@@ -2691,3 +3020,249 @@ class AllImageIterator(BatchIterator):
         	return warped_img, tform
     	else:
         	return warped_img
+
+class ShortEpochIterator(BatchIterator):
+    def __init__(self, batch_size, shuffle=True, seed=42, max_iterations=1000):
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.random = np.random.RandomState(seed)
+	self.max_iterations = max_iterations
+
+    def __iter__(self):
+        bs = self.batch_size
+        for i in range((self.max_iterations + bs - 1) // bs):
+            sl = slice(i * bs, (i + 1) * bs)
+            Xb = self._sldict(self.X, sl)
+            if self.y is not None:
+                yb = self.y[sl]
+            else:
+                yb = None
+            yield self.transform(Xb, yb)
+
+    def _sldict(self,arr, sl):
+        if isinstance(arr, dict):
+                return {k: v[sl] for k, v in arr.items()}
+        else:
+                return arr[sl]
+
+class SingleCacheIterator(BatchIterator):
+
+    ''' 
+	This is a subclass of BatchIterator by reading only ONE cache npy inside the cache directory only, randomly
+    '''
+
+    # add directory variable to original
+    def __init__(self, batch_size, shuffle=False, seed=42, cache_dir=None, n_classes=10, augment=False, regression=False, grayscale=False):
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.random = np.random.RandomState(seed)
+	self.cache_dir = cache_dir
+	self.n_classes = n_classes
+	self.augment = augment
+	self.grayscale = grayscale
+	self.regression = regression
+
+    # generate batches for all images, instead of just a subset 
+    def __iter__(self):
+	# first look for npy chunks via glob
+	cache_chunks = list(glob.iglob(self.cache_dir + "/train_data_inputs*cache.npy"))
+	bs = self.batch_size
+
+        cache_chunk = cache_chunks[np.argmax(np.random.random(len(cache_chunks)))]
+
+        # load numpy input/target
+        #print("Info: Loading random numpy chunk "+cache_chunk)
+        cache_target = re.sub(r'train_data_inputs','train_data_targets',cache_chunk)
+        self.X = np.load(cache_chunk)
+        self.y_target = np.load(cache_target).astype(float32)
+
+        # manipulate matrices so that it fits standard criteria
+        if self.grayscale is False:
+            self.X = self.X.reshape(-1,3,np.size(self.X,2),np.size(self.X,3)).astype(float32)
+        else:
+            self.X = self.X.reshape(-1,1,np.size(self.X,1),np.size(self.X,2)).astype(float32)
+
+        [self.X,self.y_target] = self.shuffle_set(self.X,self.y_target)
+
+	if self.regression is True:
+	        self.y = np.zeros(shape=(np.size(self.y_target),self.n_classes))
+        	for i in range(0,self.n_classes):
+            		self.y[self.y_target == i,i] = 1.00
+	        self.y = self.y.astype(float32)
+	else:
+		self.y = self.y_target.astype(int32)
+
+        # generate usual batches
+        for i in range((len(self.X) + bs -1) // bs):
+            sl = slice(i * bs, (i + 1) * bs)
+            Xb = self._sldict(self.X, sl)
+            if self.y is not None:
+                yb = self.y[sl]
+            else:
+                yb = None
+            yield self.transform(Xb,yb)
+
+    def _sldict(self,arr, sl):
+    	if isinstance(arr, dict):
+        	return {k: v[sl] for k, v in arr.items()}
+    	else:
+        	return arr[sl]
+
+    def shuffle_set(self,X,Y):
+        X_shuffle = copy(X)
+        Y_shuffle = copy(Y)
+        i=0
+        rs = cross_validation.ShuffleSplit(size(Y,0), n_iter=1, test_size=0, random_state=0)
+        for train_index, test_index in rs:
+            for j in train_index:
+                X_shuffle[i] = copy(X[j])
+                Y_shuffle[i] = copy(Y[j])
+                i += 1
+        return [X_shuffle, Y_shuffle]
+
+
+    def transform(self, Xb, yb):
+	Xb, yb = super(SingleCacheIterator, self).transform(Xb, yb)
+	if self.augment is False:
+		return Xb, yb
+	bs = Xb.shape[0]
+	indices = np.random.choice(bs, (2 * bs) / 3, replace=False)
+	indices_cw = indices[:len(indices)/2]
+	indices_ccw = indices[len(indices)/2:]
+	Xb_transformed = Xb.copy()
+	# Xb will definitely have c01, so feed directly
+	for i in indices_ccw:
+		#print("Info: Rotating ccw for index="+str(i))
+		Xb_transformed[i] = self.im_affine_transform(Xb[i],
+							     scale=1.00,
+							     rotation=10.0,
+							     shear=0.0,
+							     translation_x=0.0,
+							     translation_y=15.0)
+	for i in indices_cw:
+		#print("Info: Rotating cw for index="+str(i))
+                Xb_transformed[i] = self.im_affine_transform(Xb[i],
+                                                             scale=1.00,
+                                                             rotation=-10.0,
+                                                             shear=0.0,
+                                                             translation_x=0.0,
+                                                             translation_y=-15.0)
+	return Xb_transformed, yb
+
+    def warp(self,img, tf, output_shape, mode='constant', order=0):
+    	"""
+    	This wrapper function is faster than skimage.transform.warp
+   	"""
+   	m = tf.params
+    	img = img.transpose(2, 0, 1)
+    	t_img = np.zeros(img.shape, img.dtype)
+    	for i in range(t_img.shape[0]):
+        	t_img[i] = _warp_fast(img[i], m, output_shape=output_shape[:2],
+                              	      mode=mode, order=order)
+    	t_img = t_img.transpose(1, 2, 0)
+    	return t_img
+
+    def im_affine_transform(self,img, scale, rotation, shear, translation_y, translation_x, return_tform=False):
+    	# Assumed img in c01. Convert to 01c for skimage
+    	img = img.transpose(1, 2, 0)
+    	# Normalize so that the param acts more like im_rotate, im_translate etc
+    	scale = 1 / scale
+    	translation_x = - translation_x
+    	translation_y = - translation_y
+
+    	# shift to center first so that image is rotated around center
+    	center_shift = np.array((img.shape[0], img.shape[1])) / 2. - 0.5
+    	tform_center = SimilarityTransform(translation=-center_shift)
+    	tform_uncenter = SimilarityTransform(translation=center_shift)
+
+    	rotation = np.deg2rad(rotation)
+    	tform = AffineTransform(scale=(scale, scale), rotation=rotation,
+        	                shear=shear,
+                            	translation=(translation_x, translation_y))
+    	tform = tform_center + tform + tform_uncenter
+
+    	warped_img = self.warp(img, tform, output_shape=img.shape)
+
+    	# Convert back from 01c to c01
+    	warped_img = warped_img.transpose(2, 0, 1)
+    	warped_img = warped_img.astype(img.dtype)
+    	if return_tform:
+        	return warped_img, tform
+    	else:
+        	return warped_img
+
+class DriverTestSplit(TrainSplit):
+
+    def __init__(self, regression=False, max_test_split=2000, grayscale=False, cache_dir="", n_classes=10):
+	self.max_test_split = max_test_split
+	self.cache_dir = cache_dir
+	self.grayscale = grayscale
+	self.n_classes = n_classes
+	self.regression = regression
+
+    def __call__(self, X, y, net):
+
+	print("Info: Splitting train-test")
+        cache_chunks = list(glob.iglob(self.cache_dir + "/val_data_inputs*cache.npy"))
+
+	X_train = X
+	y_train = y
+
+	X_valid = list()
+	y_valid = list()
+
+        for cache_chunk in cache_chunks:
+                # load numpy input/target
+                cache_target = re.sub(r'val_data_inputs','val_data_targets',cache_chunk)
+                X_cv = np.load(cache_chunk)
+                y_target = np.load(cache_target).astype(float32)
+
+                # manipulate matrices so that it fits standard criteria
+                if self.grayscale is False:
+                        X_cv = X_cv.reshape(-1,3,np.size(X_cv,2),np.size(X_cv,3)).astype(float16)
+                else:
+                        X_cv = X_valid.reshape(-1,1,np.size(X_cv,1),np.size(X_cv.X,2)).astype(float16)
+
+
+		if self.regression is True:			
+	                y_cv = np.zeros(shape=(np.size(y_target),self.n_classes))
+        	        for i in range(0,self.n_classes):
+                        	y_cv[y_target == i,i] = 1.00
+                	y_cv = y_cv.astype(float16)
+		else:
+			y_cv = y_target.astype(int32)
+
+		for i in range(len(y_cv)):
+			X_valid.append(X_cv[i])
+			y_valid.append(y_cv[i])
+
+	print("Info: Total valid cnt = {}".format(len(X_valid)))
+	print("Info: Total train cnt (single cache only) = {}".format(len(X_train)))
+        return X_train, X_valid, y_train, y_valid
+
+    def _sldict(self,arr, sl):
+    	if isinstance(arr, dict):
+        	return {k: v[sl] for k, v in arr.items()}
+    	else:
+        	return arr[sl]
+
+class EarlyStopping(object):
+    def __init__(self, patience=100):
+        self.patience = patience
+        self.best_valid = np.inf
+        self.best_valid_epoch = 0
+        self.best_weights = None
+
+    def __call__(self, nn, train_history):
+        current_valid = train_history[-1]['valid_loss']
+        current_epoch = train_history[-1]['epoch']
+        if current_valid < self.best_valid:
+            self.best_valid = current_valid
+            self.best_valid_epoch = current_epoch
+            self.best_weights = nn.get_all_params_values()
+        elif self.best_valid_epoch + self.patience < current_epoch:
+            print("Early stopping.")
+            print("Best valid loss was {:.6f} at epoch {}.".format(
+                self.best_valid, self.best_valid_epoch))
+            nn.load_params_from(self.best_weights)
+            raise StopIteration()
