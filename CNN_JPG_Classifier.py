@@ -11,6 +11,8 @@
 #################
 from scipy import misc
 from scipy import ndimage
+import scipy.ndimage as ndi
+from scipy import linalg
 import random
 import numpy as np
 from nolearn.lasagne import PrintLayerInfo
@@ -20,10 +22,12 @@ from lasagne.updates import adadelta
 from lasagne.updates import sgd
 from lasagne.updates import adam
 from lasagne.nonlinearities import softmax
+from lasagne.nonlinearities import rectify
 from lasagne.objectives import categorical_crossentropy
 from nolearn.lasagne import NeuralNet
 from nolearn.lasagne import BatchIterator
 from nolearn.lasagne import TrainSplit
+from six.moves import range
 import matplotlib.pyplot as plt
 import glob
 from numpy import *
@@ -100,9 +104,9 @@ class CNN_JPG_Classifier:
     img_shift  = 10
 
     # VGG16 average
-    # IMAGE_MEAN = np.array([103.939,116.779,123.68]).reshape(3,1,1)
+    IMAGE_MEAN = np.array([103.939,116.779,123.68]).reshape(3,1,1)
     # VGG_CNN_S average
-    IMAGE_MEAN = np.array([102.717,115.773,123.51]).reshape(3,1,1)
+    # IMAGE_MEAN = np.array([102.717,115.773,123.51]).reshape(3,1,1)
 
     verbose = False
     
@@ -149,9 +153,12 @@ class CNN_JPG_Classifier:
         self.img_width = abs(x2-x1)
         self.img_height = abs(y2-y1)
 
-    def resize_image(self,img):
+    def resize_image(self,img,opencv=False):
         if self.resize is True:
-            return misc.imresize(img,[self.img_width,self.img_height])
+	    if opencv is True:
+		    return cv2.resize(img, (self.img_width, self.img_height))
+	    else:
+	            return misc.imresize(img,[self.img_width,self.img_height])
         else:
             return img
 
@@ -160,6 +167,18 @@ class CNN_JPG_Classifier:
 
     def set_max_train(self,max_train):
 	self.n_train_max = max_train
+
+    def shuffle_set(self,X,Y):
+        X_shuffle = copy(X)
+        Y_shuffle = copy(Y)
+        i=0
+        rs = cross_validation.ShuffleSplit(size(Y,0), n_iter=1, test_size=0, random_state=0)
+        for train_index, test_index in rs:
+            for j in train_index:
+                X_shuffle[i] = copy(X[j])
+                Y_shuffle[i] = copy(Y[j])
+                i += 1
+        return [X_shuffle, Y_shuffle]
 
     # training - read and save to cache
     def read_train_dirs(self,close_dir,open_dir,extra=list(),type="jpg",blur=True):
@@ -674,18 +693,20 @@ class CNN_JPG_Classifier:
 
     # training - read all and save to npy files
     # validation splits are saved as a different name and never invoked during AllImageIterator type of scenarios
-    def read_train_dirs_all_valsplit(self,pics_dir=list(),val_imgs=list(),all_class_represented=True,output_dir="./",type="jpg",blur=True):
+    def read_train_dirs_all_valsplit(self,pics_dir=list(),val_imgs=list(),all_class_represented=False,output_dir="./",type="jpg",blur=False):
         # for multi-class support
         pics_dir_len = 0
         pics_dir_pics_listoflist = [list()] * self.num_class
         if self.num_class > 0:
             for i in range(0,self.num_class):
-                print("Class:"+pics_dir[i])
-                pics_dir_pics_listoflist[i].append(list(glob.iglob(pics_dir[i]+"/*."+type)))
+                #print("Class:"+pics_dir[i])
+		img_files = list(glob.iglob(pics_dir[i]+"/*."+type))
+		np.random.shuffle(img_files)
+                pics_dir_pics_listoflist[i].append(img_files)
                 pics_dir_len += len(list(glob.iglob(pics_dir[i]+"/*."+type)))
         multiplier = 1
         total_samples = pics_dir_len
-        nsamples = min(min(pics_dir_len,ceil((self.num_class) * self.n_train_max/self.num_class)),self.n_train_max)
+        nsamples = min(min(pics_dir_len,ceil((self.num_class) * self.n_train_max/self.num_class)),self.n_train_max).astype(uint32)
         print("Info: Number of samples in current chunk:"+str(nsamples))            
         if self.grayscale is True:
             inputs  = np.zeros(shape=(nsamples*multiplier,self.img_height,self.img_width)) # only at the section of interest
@@ -708,10 +729,11 @@ class CNN_JPG_Classifier:
                     for pic in pics_dir_pics_list:
 			flbase = os.path.basename(pic)
                         if i < multiplier * (k+1) * self.n_train_max / self.num_class:
-                            if self.verbose == True:
-                                print("Info: Chunk "+str(chunk_cnt)+": Reading (training) class:"+str(k)+", pic "+str(i)+":"+str(pic))
-                            img = misc.imread(pic)
+                            #if self.verbose == True:
+                            #    print("Info: Chunk "+str(chunk_cnt)+": Reading (training) class:"+str(k)+", pic "+str(i)+":"+str(pic))
+                            img = cv2.imread(pic)
 			    if flbase in val_imgs:
+				#print("Debug: Pic "+str(pic)+" is a validation pic")
 				val_pics_idx.append(i)
 			    else:
 				train_pics_idx.append(i)
@@ -724,19 +746,37 @@ class CNN_JPG_Classifier:
 				    else:
 					img_blur = img    
                                     if self.zoom_mode is True:
-                                        inputs[i,:,:] = self.resize_image(self.rgb2gray(img_blur[self.img_y1:self.img_y2,self.img_x1:self.img_x2]))
+                                        inputs[i,:,:] = self.resize_image(self.rgb2gray(img_blur[self.img_y1:self.img_y2,self.img_x1:self.img_x2]),opencv=True)
                                     else:
-	                                inputs[i,:,:] = self.resize_image(self.rgb2gray(img_blur))
+	                                inputs[i,:,:] = self.resize_image(self.rgb2gray(img_blur),opencv=True)
                             else:
-                                img_blur = img
-                                if self.zoom_mode is True:
-                                    inputs[i,0,:,:] = self.resize_image(img_blur[self.img_y1:self.img_y2,self.img_x1:self.img_x2,0])
-                                    inputs[i,1,:,:] = self.resize_image(img_blur[self.img_y1:self.img_y2,self.img_x1:self.img_x2,1])
-                                    inputs[i,2,:,:] = self.resize_image(img_blur[self.img_y1:self.img_y2,self.img_x1:self.img_x2,2])
+
+				if self.pretrain_model is True and self.pretrain_name is "inception":
+                                    flip_channel = True
                                 else:
-                                    inputs[i,0,:,:] = self.resize_image(img_blur[:,:,0])
-                                    inputs[i,1,:,:] = self.resize_image(img_blur[:,:,1])
-                                    inputs[i,2,:,:] = self.resize_image(img_blur[:,:,2])
+                                    flip_channel = False
+
+                                img_blur = img.copy()
+                                if self.zoom_mode is True:
+				    img_resized = self.resize_image(img_blur[self.img_y1:self.img_y2,self.img_x1:self.img_x2,:],opencv=True)
+				    if flip_channel is False:
+	                                    inputs[i,0,:,:] = img_resized[:,:,0]
+        	                            inputs[i,1,:,:] = img_resized[:,:,1]
+                	                    inputs[i,2,:,:] = img_resized[:,:,2]
+				    else:
+                                            inputs[i,0,:,:] = img_resized[:,:,2]
+                                            inputs[i,1,:,:] = img_resized[:,:,1]
+                                            inputs[i,2,:,:] = img_resized[:,:,0]
+                                else:
+				    img_resized = self.resize_image(img_blur[:,:,:],opencv=True)
+                                    if flip_channel is False:
+                                            inputs[i,0,:,:] = img_resized[:,:,0]
+                                            inputs[i,1,:,:] = img_resized[:,:,1]
+                                            inputs[i,2,:,:] = img_resized[:,:,2]
+                                    else:
+                                            inputs[i,0,:,:] = img_resized[:,:,2]
+                                            inputs[i,1,:,:] = img_resized[:,:,1]
+                                            inputs[i,2,:,:] = img_resized[:,:,0]
                             targets[i] = k
                             i+=1 # inc index per class
                             accumulated_samples += 1
@@ -755,39 +795,40 @@ class CNN_JPG_Classifier:
                     
             if self.pretrain_model is True:
 		# requirements for pretraining
-		# change from RGB to BGR (misc.imread is RGB)
 		if self.pretrain_name is not "inception":
-			inputs = inputs[:,::-1,:,:]
 			if self.grayscale is False:
-				inputs = inputs - self.IMAGE_MEAN
+				inputs[:, 0, :, :] = inputs[:, 0, :, :] - self.IMAGE_MEAN[0]
+				inputs[:, 1, :, :] = inputs[:, 1, :, :] - self.IMAGE_MEAN[1]
+				inputs[:, 2, :, :] = inputs[:, 2, :, :] - self.IMAGE_MEAN[2]
 			else:
 				inputs = inputs - self.rgb2gray(self.IMAGE_MEAN)
 		else:
-			# inceptions uses RGB
-			# scale to -1, 1
 			inputs = (inputs - 128.0000) / 128.0000
             else:
 	        inputs = (inputs / 255.0000) - 0.5
 
+	    # shuffle inputs and targets first before continuing
+	    [X_train,Y_train] = self.shuffle_set(inputs[train_pics_idx],targets[train_pics_idx])
+	    [X_cv,Y_cv] = self.shuffle_set(inputs[val_pics_idx],targets[val_pics_idx])
 
-            self.X_train = inputs[train_pics_idx]
-            self.Y_train = targets[train_pics_idx]
-	    self.X_cv = inputs[val_pics_idx]
-	    self.Y_cv = targets[val_pics_idx]
+            self.X_train = X_train
+            self.Y_train = Y_train
+	    self.X_cv = X_cv
+	    self.Y_cv = Y_cv	
 
             # save the values too
-            np.save(output_dir+"train_data_inputs."+str(chunk_cnt)+".cache",inputs[train_pics_idx])
-            np.save(output_dir+"train_data_targets."+str(chunk_cnt)+".cache",targets[train_pics_idx])
+            np.save(output_dir+"train_data_inputs."+str(chunk_cnt)+".cache",X_train)
+            np.save(output_dir+"train_data_targets."+str(chunk_cnt)+".cache",Y_train)
             print("Info: Saved X_train model to "+output_dir+"train_data_inputs."+str(chunk_cnt)+".cache")
             print("Info: Saved Y_train model to "+output_dir+"train_data_targets."+str(chunk_cnt)+".cache")
                 
 	    if len(inputs[val_pics_idx]) > 0:
-	            np.save(output_dir+"val_data_inputs."+str(chunk_cnt)+".cache",inputs[val_pics_idx])
-	            np.save(output_dir+"val_data_targets."+str(chunk_cnt)+".cache",targets[val_pics_idx])
+	            np.save(output_dir+"val_data_inputs."+str(chunk_cnt)+".cache",X_cv)
+	            np.save(output_dir+"val_data_targets."+str(chunk_cnt)+".cache",Y_cv)
 	            print("Info: Saved X_cv model to "+output_dir+"val_data_inputs."+str(chunk_cnt)+".cache")
 	            print("Info: Saved Y_cv model to "+output_dir+"val_data_targets."+str(chunk_cnt)+".cache")
-		    print("Info: Train split = {}".format(len(inputs[train_pics_idx])))
-		    print("Info: Validation split = {}".format(len(inputs[val_pics_idx])))
+		    print("Info: Train split = {}".format(len(X_train)))
+		    print("Info: Validation split = {}".format(len(X_cv)))
 
             # recalculate nsamples and reassign list
             pics_dir_len = new_pics_dir_len
@@ -1352,53 +1393,54 @@ class CNN_JPG_Classifier:
                 ],
                 #layer parameters:
                 input_shape = (None, self.img_ch, self.img_height, self.img_width),
-                conv1_num_filters = 64,  conv1_filter_size = (3, 3), conv1_pad = 'same', conv1_flip_filters=False, 
-		conv2_num_filters = 64,  conv2_filter_size = (3, 3), conv2_pad = 'same', conv2_flip_filters=False, 
+                conv1_num_filters = 64,  conv1_filter_size = (3, 3), conv1_pad = 'same', conv1_flip_filters=False, conv1_nonlinearity=rectify,
+		conv2_num_filters = 64,  conv2_filter_size = (3, 3), conv2_pad = 'same', conv2_flip_filters=False, conv2_nonlinearity=rectify,
 		pool1_pool_size = (2,2), pool1_stride = 2,
-                conv3_num_filters = 128, conv3_filter_size = (3, 3), conv3_pad = 'same', conv3_flip_filters=False, 
-		conv4_num_filters = 128, conv4_filter_size = (3, 3), conv4_pad = 'same', conv4_flip_filters=False, 
+                conv3_num_filters = 128, conv3_filter_size = (3, 3), conv3_pad = 'same', conv3_flip_filters=False, conv3_nonlinearity=rectify,
+		conv4_num_filters = 128, conv4_filter_size = (3, 3), conv4_pad = 'same', conv4_flip_filters=False, conv4_nonlinearity=rectify,
 		pool2_pool_size = (2,2), pool2_stride = 2,
-                conv5_num_filters = 256, conv5_filter_size = (3, 3), conv5_pad = 'same', conv5_flip_filters=False, 
-		conv6_num_filters = 256, conv6_filter_size = (3, 3), conv6_pad = 'same', conv6_flip_filters=False, 
-		conv7_num_filters = 256, conv7_filter_size = (3, 3), conv7_pad = 'same', conv7_flip_filters=False, 
-                conv8_num_filters = 256, conv8_filter_size = (3, 3), conv8_pad = 'same', conv8_flip_filters=False, 
+                conv5_num_filters = 256, conv5_filter_size = (3, 3), conv5_pad = 'same', conv5_flip_filters=False, conv5_nonlinearity=rectify,
+		conv6_num_filters = 256, conv6_filter_size = (3, 3), conv6_pad = 'same', conv6_flip_filters=False, conv6_nonlinearity=rectify,
+		conv7_num_filters = 256, conv7_filter_size = (3, 3), conv7_pad = 'same', conv7_flip_filters=False, conv7_nonlinearity=rectify,
+                conv8_num_filters = 256, conv8_filter_size = (3, 3), conv8_pad = 'same', conv8_flip_filters=False, conv8_nonlinearity=rectify,
 		pool3_pool_size = (2,2), pool3_stride = 2,
-		conv9_num_filters  = 512, conv9_filter_size  = (3, 3), conv9_pad  = 'same', conv9_flip_filters=False, 
-		conv10_num_filters = 512, conv10_filter_size = (3, 3), conv10_pad = 'same', conv10_flip_filters=False, 
-                conv11_num_filters = 512, conv11_filter_size = (3, 3), conv11_pad = 'same', conv11_flip_filters=False, 
-		conv12_num_filters = 512, conv12_filter_size = (3, 3), conv12_pad = 'same', conv12_flip_filters=False, 
+		conv9_num_filters  = 512, conv9_filter_size  = (3, 3), conv9_pad  = 'same', conv9_flip_filters=False, conv9_nonlinearity=rectify,
+		conv10_num_filters = 512, conv10_filter_size = (3, 3), conv10_pad = 'same', conv10_flip_filters=False, conv10_nonlinearity=rectify,
+                conv11_num_filters = 512, conv11_filter_size = (3, 3), conv11_pad = 'same', conv11_flip_filters=False, conv11_nonlinearity=rectify,
+		conv12_num_filters = 512, conv12_filter_size = (3, 3), conv12_pad = 'same', conv12_flip_filters=False, conv12_nonlinearity=rectify,
 		pool4_pool_size = (2,2), pool4_stride = 2,
-		conv13_num_filters = 512, conv13_filter_size = (3, 3), conv13_pad = 'same', conv13_flip_filters=False, 
-		conv14_num_filters = 512, conv14_filter_size = (3, 3), conv14_pad = 'same', conv14_flip_filters=False, 
-		conv15_num_filters = 512, conv15_filter_size = (3, 3), conv15_pad = 'same', conv15_flip_filters=False, 
-		conv16_num_filters = 512, conv16_filter_size = (3, 3), conv16_pad = 'same', conv16_flip_filters=False, 
+		conv13_num_filters = 512, conv13_filter_size = (3, 3), conv13_pad = 'same', conv13_flip_filters=False, conv13_nonlinearity=rectify,
+		conv14_num_filters = 512, conv14_filter_size = (3, 3), conv14_pad = 'same', conv14_flip_filters=False, conv14_nonlinearity=rectify,
+		conv15_num_filters = 512, conv15_filter_size = (3, 3), conv15_pad = 'same', conv15_flip_filters=False, conv15_nonlinearity=rectify,
+		conv16_num_filters = 512, conv16_filter_size = (3, 3), conv16_pad = 'same', conv16_flip_filters=False, conv16_nonlinearity=rectify,
 		pool5_pool_size = (2,2), pool5_stride = 2,
-                hidden17_num_units = 4096,
+                hidden17_num_units = 4096, hidden17_nonlinearity = rectify,
                 dropout1_p=0.50,
-                hidden18_num_units = 4096,
+                hidden18_num_units = 4096, hidden18_nonlinearity = rectify,
                 dropout2_p=0.50,
-                output_nonlinearity = None,
+                output_nonlinearity = softmax,
                 #NOTE: REMEMBER THAT 1 and 0 are two classes, not one!!
                 output_num_units = self.num_class,
-
+                objective_loss_function=categorical_crossentropy,       
                 #optimization parameters:
-                # don't use adadelta, will run out of memory
-                #update = nesterov_momentum,
-                update = sgd,
-                # started at 0.005
-                update_learning_rate = theano.shared(float32(0.01)),
-                #update_momentum = theano.shared(float32(0.9)),
-                regression = True,
-                max_epochs = 250,
+                update = nesterov_momentum,
+                #update = sgd,
+                update_learning_rate = theano.shared(float32(0.0001)),
+                update_momentum      = theano.shared(float32(0.9)),
+                regression = False,
+                max_epochs = 2000,
                 verbose = 3,
+		#train_split=DriverTestSplit(max_test_split=2500, cache_dir="./data/kaggle/statefarm/vgg_cache/"),
+		train_split=DriverTrainTestSplit(max_test_split=2500, cache_dir="./data/kaggle/statefarm/vgg_cache/"),
                 on_epoch_finished=[
-                    AdjustVariable('update_learning_rate',start=0.01, stop=0.005),
-                    #AdjustVariable('update_momentum', start=0.9, stop=0.9),
+                    EarlyStopping(patience=25),
+                    Scheduler('update_learning_rate',start=0.0001, interval=10, div_factor=5.0000),
                 ],
-                #batch_iterator_train=AllImageIterator(batch_size=12,
-                #                                      cache_dir="./kaggle/statefarm/vgg_cache/",
-                #                                      augment=False)
-                batch_iterator_train=BatchIterator(batch_size=12)
+                #batch_iterator_train=SingleCacheIterator(batch_size=16,
+                #                                         cache_dir="./data/kaggle/statefarm/vgg_cache/",
+                #                                         regression=False,
+                #                                         augment=False)
+		batch_iterator_train=ShortEpochIterator(batch_size=16,max_iterations=500,augment=True)
                 )
         self.classifier.initialize()
         layers_info = PrintLayerInfo()
@@ -1406,7 +1448,7 @@ class CNN_JPG_Classifier:
 		
     # Original VGG16
     # works with only 224x224
-    def define_cnn_type1_driver_deep_vggnet(self):
+    def define_cnn_type1_vgg16(self):
         # one possibility
         self.classifier = NeuralNet(
             layers = [
@@ -1437,18 +1479,32 @@ class CNN_JPG_Classifier:
                 ],
                 #layer parameters:
                 input_shape = (None, self.img_ch, self.img_height, self.img_width),
-                conv1_num_filters = 64,  conv1_filter_size = (3, 3), conv1_pad = 'same', conv1_flip_filters=False, conv2_num_filters = 64,  conv2_filter_size = (3, 3), conv2_pad = 'same', conv2_flip_filters=False, pool1_pool_size = (2,2), pool1_stride = 2,
-                conv3_num_filters = 128, conv3_filter_size = (3, 3), conv3_pad = 'same', conv3_flip_filters=False, conv4_num_filters = 128, conv4_filter_size = (3, 3), conv4_pad = 'same', conv4_flip_filters=False, pool2_pool_size = (2,2), pool2_stride = 2,
-                conv5_num_filters = 256, conv5_filter_size = (3, 3), conv5_pad = 'same', conv5_flip_filters=False, conv6_num_filters = 256, conv6_filter_size = (3, 3), conv6_pad = 'same', conv6_flip_filters=False, conv7_num_filters = 256, conv7_filter_size = (3, 3), conv7_pad = 'same', conv7_flip_filters=False, pool3_pool_size = (2,2), pool3_stride = 2,
-                conv8_num_filters = 512, conv8_filter_size = (3, 3), conv8_pad = 'same', conv8_flip_filters=False, conv9_num_filters = 512, conv9_filter_size = (3, 3), conv9_pad = 'same', conv9_flip_filters=False, conv10_num_filters = 512, conv10_filter_size = (3, 3), conv10_pad = 'same', conv10_flip_filters=False, pool4_pool_size = (2,2), pool4_stride = 2,
-                conv11_num_filters = 512, conv11_filter_size = (3, 3), conv11_pad = 'same', conv11_flip_filters=False, conv12_num_filters = 512, conv12_filter_size = (3, 3), conv12_pad = 'same', conv12_flip_filters=False, conv13_num_filters = 512, conv13_filter_size = (3, 3), conv13_pad = 'same', conv13_flip_filters=False, pool5_pool_size = (2,2), pool5_stride = 2,
-                hidden14_num_units = 4096,
+                conv1_num_filters = 64,  conv1_filter_size = (3, 3), conv1_pad = 'same', conv1_flip_filters=False, conv1_nonlinearity=rectify,
+		conv2_num_filters = 64,  conv2_filter_size = (3, 3), conv2_pad = 'same', conv2_flip_filters=False, conv2_nonlinearity=rectify,
+		pool1_pool_size = (2,2), pool1_stride = 2,
+                conv3_num_filters = 128, conv3_filter_size = (3, 3), conv3_pad = 'same', conv3_flip_filters=False, conv3_nonlinearity=rectify,
+		conv4_num_filters = 128, conv4_filter_size = (3, 3), conv4_pad = 'same', conv4_flip_filters=False, conv4_nonlinearity=rectify,
+		pool2_pool_size = (2,2), pool2_stride = 2,
+                conv5_num_filters = 256, conv5_filter_size = (3, 3), conv5_pad = 'same', conv5_flip_filters=False, conv5_nonlinearity=rectify,
+		conv6_num_filters = 256, conv6_filter_size = (3, 3), conv6_pad = 'same', conv6_flip_filters=False, conv6_nonlinearity=rectify,
+		conv7_num_filters = 256, conv7_filter_size = (3, 3), conv7_pad = 'same', conv7_flip_filters=False, conv7_nonlinearity=rectify,
+		pool3_pool_size = (2,2), pool3_stride = 2,
+                conv8_num_filters = 512, conv8_filter_size = (3, 3), conv8_pad = 'same', conv8_flip_filters=False, conv8_nonlinearity=rectify,
+		conv9_num_filters = 512, conv9_filter_size = (3, 3), conv9_pad = 'same', conv9_flip_filters=False, conv9_nonlinearity=rectify,
+		conv10_num_filters = 512, conv10_filter_size = (3, 3), conv10_pad = 'same', conv10_flip_filters=False, conv10_nonlinearity=rectify,
+		pool4_pool_size = (2,2), pool4_stride = 2,
+                conv11_num_filters = 512, conv11_filter_size = (3, 3), conv11_pad = 'same', conv11_flip_filters=False, conv11_nonlinearity=rectify,
+		conv12_num_filters = 512, conv12_filter_size = (3, 3), conv12_pad = 'same', conv12_flip_filters=False, conv12_nonlinearity=rectify,
+		conv13_num_filters = 512, conv13_filter_size = (3, 3), conv13_pad = 'same', conv13_flip_filters=False, conv13_nonlinearity=rectify,
+		pool5_pool_size = (2,2), pool5_stride = 2,
+                hidden14_num_units = 4096, hidden14_nonlinearity=rectify,
                 dropout1_p=0.50,
-                hidden15_num_units = 4096,
+                hidden15_num_units = 4096, hidden15_nonlinearity=rectify,
                 dropout2_p=0.50, 
-                output_nonlinearity = None,
+                output_nonlinearity = softmax,
                 #NOTE: REMEMBER THAT 1 and 0 are two classes, not one!!
                 output_num_units = self.num_class,
+                objective_loss_function=categorical_crossentropy, 
 
                 #optimization parameters:
 		# don't use adadelta, will run out of memory
@@ -1981,23 +2037,28 @@ class CNN_JPG_Classifier:
         self.classifier = NeuralNet(
 		layers = inception_v3,
                 #optimization parameters:
-                update = sgd,
+                update = nesterov_momentum,
+#               update = sgd,
                 update_learning_rate = theano.shared(float32(0.001)),
+                update_momentum      = theano.shared(float32(0.9)),
                 regression = False,
 		objective_loss_function=categorical_crossentropy,		
                 max_epochs = 1000,
                 verbose = 10,
-		train_split=DriverTestSplit(max_test_split=2500, cache_dir="./data/kaggle/statefarm/inception_cache/"),
+		train_split=DriverTrainTestSplit(max_test_split=2500, cache_dir="./data/kaggle/statefarm/inception_cache/"),
+		#train_split=DriverTestSplit(max_test_split=2500, cache_dir="./data/kaggle/statefarm/inception_cache/"),
                 # this code implements variable learning rate (start at 0.0005 ends at 0.00005)
                 on_epoch_finished=[
-		    EarlyStopping(patience=100),
-                    AdjustVariable('update_learning_rate',start=0.001, stop=0.0001),
+		    EarlyStopping(patience=25),
+                    Scheduler('update_learning_rate',start=0.001, interval=10, div_factor=5.0000),
+                    #AdjustVariable('update_learning_rate',start=0.001, stop=0.0001),
                 ],
                 #batch_iterator_train=BatchIterator(batch_size=16,shuffle=True)
-                batch_iterator_train=SingleCacheIterator(batch_size=32,
-                                                         cache_dir="./data/kaggle/statefarm/inception_cache/",
-							 regression=False,
-                                                         augment=False)
+                #batch_iterator_train=SingleCacheIterator(batch_size=32,
+                #                                         cache_dir="./data/kaggle/statefarm/inception_cache/",
+		# 					 regression=False,
+                #                                         augment=False)
+		batch_iterator_train=ShortEpochIterator(batch_size=32,max_iterations=500,augment=True)
                 )
         self.classifier.initialize()
         layers_info = PrintLayerInfo()
@@ -2064,23 +2125,25 @@ class CNN_JPG_Classifier:
         self.classifier = NeuralNet(
                 layers = resnet,
                 #optimization parameters:
-                update = sgd,
-                update_learning_rate = theano.shared(float32(0.001)),
+                update = nesterov_momentum,
+                update_learning_rate = theano.shared(float32(0.0001)),
+                update_momentum      = theano.shared(float32(0.9)),
                 regression = False,
 		objective_loss_function=categorical_crossentropy,
                 max_epochs = 1000,
                 verbose = 10,
-                train_split=DriverTestSplit(max_test_split=2500, cache_dir="./data/kaggle/statefarm/resnet50_cache/"),
+                train_split=DriverTrainTestSplit(max_test_split=2500, cache_dir="./data/kaggle/statefarm/resnet_cache/"),
                 # this code implements variable learning rate (start at 0.0005 ends at 0.00005)
                 on_epoch_finished=[
-                    EarlyStopping(patience=200),
-                    AdjustVariable('update_learning_rate',start=0.001, stop=0.0001),
+                    EarlyStopping(patience=25),
+		    Scheduler('update_learning_rate',start=0.0001, interval=10, div_factor=5.0000)
                 ],
                 #batch_iterator_train=BatchIterator(batch_size=16,shuffle=True)
-                batch_iterator_train=SingleCacheIterator(batch_size=32,
-                                                         cache_dir="./data/kaggle/statefarm/resnet50_cache/",
-                                                         regression=False,
-                                                         augment=False)
+		batch_iterator_train=ShortEpochIterator(batch_size=32,max_iterations=500,augment=True)
+                #batch_iterator_train=SingleCacheIterator(batch_size=32,
+                #                                         cache_dir="./data/kaggle/statefarm/resnet50_cache/",
+                #                                         regression=False,
+                #                                         augment=False)
                 )
         self.classifier.initialize()
         layers_info = PrintLayerInfo()
@@ -2546,19 +2609,19 @@ class CNN_JPG_Classifier:
     	net.append((
             	names[0],
             	ConvLayer(incoming_layer, num_filters, filter_size, pad, stride,
-                      	  flip_filters=False, nonlinearity=None) if use_bias
+                      	  flip_filters=False, nonlinearity=None,name=names[0]) if use_bias
             	else ConvLayer(incoming_layer, num_filters, filter_size, stride, pad, b=None,
-                               flip_filters=False, nonlinearity=None)
+                               flip_filters=False, nonlinearity=None,name=names[0])
         	))
 
     	net.append((
             	names[1],
-            	BatchNormLayer(net[-1][1])
+            	BatchNormLayer(net[-1][1],name=names[1])
         	))
     	if nonlin is not None:
         	net.append((
             		names[2],
-            		NonlinearityLayer(net[-1][1], nonlinearity=nonlin)
+            		NonlinearityLayer(net[-1][1], nonlinearity=nonlin,name=names[2])
         	))
 
     	return dict(net), net[-1][0]
@@ -2594,16 +2657,19 @@ class CNN_JPG_Classifier:
     	net = {}
 
     	# right branch
+	print("Right Layer 1: {} , output_shape= {}".format(incoming_layer, lasagne.layers.get_output_shape(incoming_layer)[1]))
     	net_tmp, last_layer_name = self.build_simple_block(
         	incoming_layer, map(lambda s: s % (ix, 2, 'a'), simple_block_name_pattern),
         	int(lasagne.layers.get_output_shape(incoming_layer)[1]*ratio_n_filter), 1, int(1.0/ratio_size), 0)
     	net.update(net_tmp)
 
+	print("Right Layer 2: {} , output_shape= {}".format(last_layer_name, lasagne.layers.get_output_shape(net[last_layer_name])[1]))
     	net_tmp, last_layer_name = self.build_simple_block(
         	net[last_layer_name], map(lambda s: s % (ix, 2, 'b'), simple_block_name_pattern),
         	lasagne.layers.get_output_shape(net[last_layer_name])[1], 3, 1, 1)
     	net.update(net_tmp)
 
+	print("Right Layer 3: {} , output_shape= {}".format(last_layer_name, lasagne.layers.get_output_shape(net[last_layer_name])[1]))
     	net_tmp, last_layer_name = self.build_simple_block(
         	net[last_layer_name], map(lambda s: s % (ix, 2, 'c'), simple_block_name_pattern),
         	lasagne.layers.get_output_shape(net[last_layer_name])[1]*upscale_factor, 1, 1, 0,
@@ -2615,6 +2681,7 @@ class CNN_JPG_Classifier:
 
     	# left branch
     	if has_left_branch:
+		print("Left Layer: {} , output_shape= {}".format(incoming_layer, lasagne.layers.get_output_shape(incoming_layer)[1]))
         	net_tmp, last_layer_name = self.build_simple_block(
             		incoming_layer, map(lambda s: s % (ix, 1, ''), simple_block_name_pattern),
             		int(lasagne.layers.get_output_shape(incoming_layer)[1]*4*ratio_n_filter), 1, int(1.0/ratio_size), 0,
@@ -2622,19 +2689,19 @@ class CNN_JPG_Classifier:
         	net.update(net_tmp)
         	left_tail = net[last_layer_name]
 
-    	net['res%s' % ix] = ElemwiseSumLayer([left_tail, right_tail], coeffs=1)
-    	net['res%s_relu' % ix] = NonlinearityLayer(net['res%s' % ix], nonlinearity=rectify)
+    	net['res%s' % ix] = ElemwiseSumLayer([left_tail, right_tail], coeffs=1,name='res%s' % ix)
+    	net['res%s_relu' % ix] = NonlinearityLayer(net['res%s' % ix], nonlinearity=rectify,name='res%s_relu' % ix)
 
     	return net, 'res%s_relu' % ix
 
     def build_resnet50_model(self):
     	net = {}
-    	net['input'] = InputLayer((None, 3, 224, 224))
+    	net['input'] = InputLayer((None, 3, 224, 224),name="input")
     	sub_net, parent_layer_name = self.build_simple_block(
         	net['input'], ['conv1', 'bn_conv1', 'conv1_relu'],
         	64, 7, 3, 2, use_bias=True)
     	net.update(sub_net)
-    	net['pool1'] = PoolLayer(net[parent_layer_name], pool_size=3, stride=2, pad=0, mode='max', ignore_border=False)
+    	net['pool1'] = PoolLayer(net[parent_layer_name], pool_size=3, stride=2, pad=0, mode='max', ignore_border=False,name="pool1")
     	block_size = list('abc')
     	parent_layer_name = 'pool1'
     	for c in block_size:
@@ -2671,9 +2738,9 @@ class CNN_JPG_Classifier:
             		sub_net, parent_layer_name = self.build_residual_block(net[parent_layer_name], 1.0/4, 1, False, 4, ix='5%s' % c)
         	net.update(sub_net)
     	net['pool5'] = PoolLayer(net[parent_layer_name], pool_size=7, stride=1, pad=0,
-                             	mode='average_exc_pad', ignore_border=False)
-    	net['fc1000'] = DenseLayer(net['pool5'], num_units=self.num_class, nonlinearity=None)
-    	net['prob'] = NonlinearityLayer(net['fc1000'], nonlinearity=softmax)
+                             	 mode='average_exc_pad', ignore_border=False, name="pool5")
+    	net['fc1000'] = DenseLayer(net['pool5'], num_units=self.num_class, nonlinearity=None,name="fc1000")
+    	net['prob'] = NonlinearityLayer(net['fc1000'], nonlinearity=softmax,name="prob")
     	return net['prob']
 
     # expect input of 224x224
@@ -2863,6 +2930,23 @@ class AdjustVariable(object):
         getattr(nn, self.name).set_value(new_value)
 	print('Info: Current learning rate for epoch = {}'.format(new_value))
 
+# start      = starting learning rate
+# div factor = amount to divide the original learning rate by
+# interval   = at which epoch should this happen?  
+class Scheduler(object):
+    def __init__(self, name, start=0.0005, div_factor=5.00000, interval=10):
+        self.name = name
+        self.start, self.div_factor, self.interval = start, div_factor, interval
+
+    def __call__(self, nn, train_history):
+        epoch = train_history[-1]['epoch']
+
+	if epoch % self.interval == 0 and epoch > 1:
+		ratio = (epoch // self.interval) * self.div_factor
+		new_value = self.start / ratio
+	        getattr(nn, self.name).set_value(new_value)
+        	print('Info: Current updated learning rate for epoch = {}'.format(new_value))
+
 # this adjusts the learning rate by checking the train_loss for the past epoch_limit
 # if max-min/max < threshold, reduce learning rate by divisor
 class StepVariable(object):
@@ -3022,13 +3106,22 @@ class AllImageIterator(BatchIterator):
         	return warped_img
 
 class ShortEpochIterator(BatchIterator):
-    def __init__(self, batch_size, shuffle=True, seed=42, max_iterations=1000):
+    def __init__(self, batch_size, shuffle=True, seed=42, max_iterations=1000, augment=False):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.random = np.random.RandomState(seed)
 	self.max_iterations = max_iterations
+        self.augment = augment
+
+    def __call__(self, X, y=None):
+        if self.shuffle:
+	    #print("Info: Shuffling training data... (size={})".format(str(len(X))))
+            self._shuffle_arrays([X, y] if y is not None else [X], self.random)
+        self.X, self.y = X, y
+        return self
 
     def __iter__(self):
+	#print("Info: Current training data... (size={})".format(str(len(self.X))))
         bs = self.batch_size
         for i in range((self.max_iterations + bs - 1) // bs):
             sl = slice(i * bs, (i + 1) * bs)
@@ -3044,6 +3137,156 @@ class ShortEpochIterator(BatchIterator):
                 return {k: v[sl] for k, v in arr.items()}
         else:
                 return arr[sl]
+
+    def transform(self, Xb, yb):
+	Xb, yb = super(ShortEpochIterator, self).transform(Xb, yb)
+	if self.augment is False:
+		return Xb, yb
+	#bs = Xb.shape[0]
+	bs = len(Xb)
+	indices = np.random.choice(bs, (2 * bs) / 3, replace=False)
+	for i in indices:
+	        IMAGE_MEAN = np.array([103.939,116.779,123.68]).reshape(3,1,1)
+                img_orig = Xb[i] + IMAGE_MEAN
+                img_orig = img_orig.astype(uint8)
+                img_orig = img_orig.transpose(1,2,0)
+		#print np.shape(img_orig)
+		img_aug = self.random_transform(img_orig,
+						rotation_range=15.,
+						height_shift_range=0.1,
+						width_shift_range=0.1,
+						shear_range=0.,
+						channel_shift_range=0.,
+						zoom_range=[0.95,1.05],
+						vertical_flip=False,
+						horizontal_flip=False,
+						blur_range=0.)
+		#cv2.imshow('aug_image',img_aug)
+		#cv2.imshow('orig',img_orig)
+		#print np.shape(img_aug)
+		img_aug = img_aug.transpose(2,0,1)
+		img_aug = img_aug.astype(float32)
+		img_aug = img_aug - IMAGE_MEAN
+		Xb[i] = img_aug.copy().astype(float32)
+
+		#while True:
+		#	k = cv2.waitKey(33)
+		#	if k == 27:
+		#		break
+
+	return Xb, yb
+
+    def random_channel_shift(self,x, intensity, channel_index=0):
+    	x = np.rollaxis(x, channel_index, 0)
+    	min_x, max_x = np.min(x), np.max(x)
+    	channel_images = [np.clip(x_channel + np.random.uniform(-intensity, intensity), min_x, max_x)
+                          for x_channel in x]
+    	x = np.stack(channel_images, axis=0)
+    	x = np.rollaxis(x, 0, channel_index+1)
+    	return x
+
+    def apply_transform(self,x, transform_matrix, channel_index=0, fill_mode='nearest', cval=0.):
+        x = np.rollaxis(x, channel_index, 0)
+        final_affine_matrix = transform_matrix[:2, :2]
+        final_offset = transform_matrix[:2, 2]
+        channel_images = [ndi.interpolation.affine_transform(x_channel, final_affine_matrix,
+                      final_offset, order=0, mode=fill_mode, cval=cval) for x_channel in x]
+        x = np.stack(channel_images, axis=0)
+        x = np.rollaxis(x, 0, channel_index+1)
+        return x
+
+    def flip_axis(self,x, axis):
+        x = np.asarray(x).swapaxes(axis, 0)
+        x = x[::-1, ...]
+        x = x.swapaxes(0, axis)
+        return x
+
+    def transform_matrix_offset_center(self,matrix, x, y):
+        o_x = float(x) / 2 + 0.5
+        o_y = float(y) / 2 + 0.5
+        offset_matrix = np.array([[1, 0, o_x], [0, 1, o_y], [0, 0, 1]])
+        reset_matrix = np.array([[1, 0, -o_x], [0, 1, -o_y], [0, 0, 1]])
+        transform_matrix = np.dot(np.dot(offset_matrix, matrix), reset_matrix)
+        return transform_matrix
+
+    def random_transform(self,
+			 x,
+                         rotation_range=0.,
+                         height_shift_range=0.,
+                         width_shift_range=0.,
+                         shear_range=0.,
+                         zoom_range=[1.,1.],
+                         blur_range=0.,
+                         channel_shift_range=0.,
+                         fill_mode="nearest",
+                         random_zca=False,
+                         random_pca=False,
+                         horizontal_flip=False,
+                         vertical_flip=False,
+                         cval=0.):
+        row_index = 1
+        col_index = 2
+        channel_index = 3
+        img_row_index = row_index - 1
+        img_col_index = col_index - 1
+        img_channel_index = channel_index - 1
+
+        if rotation_range:
+            theta = np.pi / 180 * np.random.uniform(-rotation_range, rotation_range)
+        else:
+            theta = 0
+        rotation_matrix = np.array([[np.cos(theta), -np.sin(theta), 0],
+                                    [np.sin(theta), np.cos(theta), 0],
+                                    [0, 0, 1]])
+        if height_shift_range:
+            tx = np.random.uniform(-height_shift_range, height_shift_range) * x.shape[img_row_index]
+        else:
+            tx = 0
+
+        if width_shift_range:
+            ty = np.random.uniform(-width_shift_range, width_shift_range) * x.shape[img_col_index]
+        else:
+            ty = 0
+        translation_matrix = np.array([[1, 0, tx],
+                                       [0, 1, ty],
+                                       [0, 0, 1]])
+
+        if shear_range:
+            shear = np.random.uniform(-shear_range, shear_range)
+        else:
+            shear = 0
+        shear_matrix = np.array([[1, -np.sin(shear), 0],
+                                 [0, np.cos(shear), 0],
+                                 [0, 0, 1]])
+        if zoom_range[0] == 1 and zoom_range[1] == 1:
+            zx, zy = 1, 1
+        else:
+            zx, zy = np.random.uniform(zoom_range[0], zoom_range[1], 2)
+        zoom_matrix = np.array([[zx, 0, 0],
+                                [0, zy, 0],
+                                [0, 0, 1]])
+
+        transform_matrix = np.dot(np.dot(np.dot(rotation_matrix, translation_matrix), shear_matrix), zoom_matrix)
+        h, w = x.shape[img_row_index], x.shape[img_col_index]
+        transform_matrix = self.transform_matrix_offset_center(transform_matrix, h, w)
+        x = self.apply_transform(x, transform_matrix, img_channel_index,
+                            fill_mode=fill_mode, cval=cval)
+        if blur_range != 0.:
+            x = ndimage.gaussian_filter(x, sigma=np.random.uniform(0.,blur_range))
+
+        if channel_shift_range != 0:
+            x = self.random_channel_shift(x, channel_shift_range, img_channel_index)
+
+        if horizontal_flip:
+            if np.random.random() < 0.5:
+                x = self.flip_axis(x, img_col_index)
+
+        if vertical_flip:
+            if np.random.random() < 0.5:
+                x = self.flip_axis(x, img_row_index)
+
+	return x
+
 
 class SingleCacheIterator(BatchIterator):
 
@@ -3127,69 +3370,147 @@ class SingleCacheIterator(BatchIterator):
 		return Xb, yb
 	bs = Xb.shape[0]
 	indices = np.random.choice(bs, (2 * bs) / 3, replace=False)
-	indices_cw = indices[:len(indices)/2]
-	indices_ccw = indices[len(indices)/2:]
-	Xb_transformed = Xb.copy()
-	# Xb will definitely have c01, so feed directly
-	for i in indices_ccw:
-		#print("Info: Rotating ccw for index="+str(i))
-		Xb_transformed[i] = self.im_affine_transform(Xb[i],
-							     scale=1.00,
-							     rotation=10.0,
-							     shear=0.0,
-							     translation_x=0.0,
-							     translation_y=15.0)
-	for i in indices_cw:
-		#print("Info: Rotating cw for index="+str(i))
-                Xb_transformed[i] = self.im_affine_transform(Xb[i],
-                                                             scale=1.00,
-                                                             rotation=-10.0,
-                                                             shear=0.0,
-                                                             translation_x=0.0,
-                                                             translation_y=-15.0)
-	return Xb_transformed, yb
+	for i in indices:
+	        IMAGE_MEAN = np.array([103.939,116.779,123.68]).reshape(3,1,1)
+                img_orig = Xb[i] + IMAGE_MEAN
+                img_orig = img_orig.astype(uint8)
+                img_orig = img_orig.transpose(1,2,0)
+		#print np.shape(img_orig)
+		img_aug = self.random_transform(img_orig,
+						rotation_range=15.,
+						height_shift_range=0.1,
+						width_shift_range=0.1,
+						shear_range=0.,
+						channel_shift_range=0.,
+						zoom_range=[0.95,1.05],
+						vertical_flip=False,
+						horizontal_flip=False,
+						blur_range=0.)
+		#cv2.imshow('aug_image',img_aug)
+		#cv2.imshow('orig',img_orig)
+		#print np.shape(img_aug)
+		img_aug = img_aug.transpose(2,0,1)
+		img_aug = img_aug.astype(float32)
+		img_aug = img_aug - IMAGE_MEAN
+		Xb[i] = img_aug.copy().astype(float32)
 
-    def warp(self,img, tf, output_shape, mode='constant', order=0):
-    	"""
-    	This wrapper function is faster than skimage.transform.warp
-   	"""
-   	m = tf.params
-    	img = img.transpose(2, 0, 1)
-    	t_img = np.zeros(img.shape, img.dtype)
-    	for i in range(t_img.shape[0]):
-        	t_img[i] = _warp_fast(img[i], m, output_shape=output_shape[:2],
-                              	      mode=mode, order=order)
-    	t_img = t_img.transpose(1, 2, 0)
-    	return t_img
+		#while True:
+		#	k = cv2.waitKey(33)
+		#	if k == 27:
+		#		break
 
-    def im_affine_transform(self,img, scale, rotation, shear, translation_y, translation_x, return_tform=False):
-    	# Assumed img in c01. Convert to 01c for skimage
-    	img = img.transpose(1, 2, 0)
-    	# Normalize so that the param acts more like im_rotate, im_translate etc
-    	scale = 1 / scale
-    	translation_x = - translation_x
-    	translation_y = - translation_y
+	return Xb, yb
 
-    	# shift to center first so that image is rotated around center
-    	center_shift = np.array((img.shape[0], img.shape[1])) / 2. - 0.5
-    	tform_center = SimilarityTransform(translation=-center_shift)
-    	tform_uncenter = SimilarityTransform(translation=center_shift)
+    def random_channel_shift(self,x, intensity, channel_index=0):
+    	x = np.rollaxis(x, channel_index, 0)
+    	min_x, max_x = np.min(x), np.max(x)
+    	channel_images = [np.clip(x_channel + np.random.uniform(-intensity, intensity), min_x, max_x)
+                          for x_channel in x]
+    	x = np.stack(channel_images, axis=0)
+    	x = np.rollaxis(x, 0, channel_index+1)
+    	return x
 
-    	rotation = np.deg2rad(rotation)
-    	tform = AffineTransform(scale=(scale, scale), rotation=rotation,
-        	                shear=shear,
-                            	translation=(translation_x, translation_y))
-    	tform = tform_center + tform + tform_uncenter
+    def apply_transform(self,x, transform_matrix, channel_index=0, fill_mode='nearest', cval=0.):
+        x = np.rollaxis(x, channel_index, 0)
+        final_affine_matrix = transform_matrix[:2, :2]
+        final_offset = transform_matrix[:2, 2]
+        channel_images = [ndi.interpolation.affine_transform(x_channel, final_affine_matrix,
+                      final_offset, order=0, mode=fill_mode, cval=cval) for x_channel in x]
+        x = np.stack(channel_images, axis=0)
+        x = np.rollaxis(x, 0, channel_index+1)
+        return x
 
-    	warped_img = self.warp(img, tform, output_shape=img.shape)
+    def flip_axis(self,x, axis):
+        x = np.asarray(x).swapaxes(axis, 0)
+        x = x[::-1, ...]
+        x = x.swapaxes(0, axis)
+        return x
 
-    	# Convert back from 01c to c01
-    	warped_img = warped_img.transpose(2, 0, 1)
-    	warped_img = warped_img.astype(img.dtype)
-    	if return_tform:
-        	return warped_img, tform
-    	else:
-        	return warped_img
+    def transform_matrix_offset_center(self,matrix, x, y):
+        o_x = float(x) / 2 + 0.5
+        o_y = float(y) / 2 + 0.5
+        offset_matrix = np.array([[1, 0, o_x], [0, 1, o_y], [0, 0, 1]])
+        reset_matrix = np.array([[1, 0, -o_x], [0, 1, -o_y], [0, 0, 1]])
+        transform_matrix = np.dot(np.dot(offset_matrix, matrix), reset_matrix)
+        return transform_matrix
+
+    def random_transform(self,
+			 x,
+                         rotation_range=0.,
+                         height_shift_range=0.,
+                         width_shift_range=0.,
+                         shear_range=0.,
+                         zoom_range=[1.,1.],
+                         blur_range=0.,
+                         channel_shift_range=0.,
+                         fill_mode="nearest",
+                         random_zca=False,
+                         random_pca=False,
+                         horizontal_flip=False,
+                         vertical_flip=False,
+                         cval=0.):
+        row_index = 1
+        col_index = 2
+        channel_index = 3
+        img_row_index = row_index - 1
+        img_col_index = col_index - 1
+        img_channel_index = channel_index - 1
+
+        if rotation_range:
+            theta = np.pi / 180 * np.random.uniform(-rotation_range, rotation_range)
+        else:
+            theta = 0
+        rotation_matrix = np.array([[np.cos(theta), -np.sin(theta), 0],
+                                    [np.sin(theta), np.cos(theta), 0],
+                                    [0, 0, 1]])
+        if height_shift_range:
+            tx = np.random.uniform(-height_shift_range, height_shift_range) * x.shape[img_row_index]
+        else:
+            tx = 0
+
+        if width_shift_range:
+            ty = np.random.uniform(-width_shift_range, width_shift_range) * x.shape[img_col_index]
+        else:
+            ty = 0
+        translation_matrix = np.array([[1, 0, tx],
+                                       [0, 1, ty],
+                                       [0, 0, 1]])
+
+        if shear_range:
+            shear = np.random.uniform(-shear_range, shear_range)
+        else:
+            shear = 0
+        shear_matrix = np.array([[1, -np.sin(shear), 0],
+                                 [0, np.cos(shear), 0],
+                                 [0, 0, 1]])
+        if zoom_range[0] == 1 and zoom_range[1] == 1:
+            zx, zy = 1, 1
+        else:
+            zx, zy = np.random.uniform(zoom_range[0], zoom_range[1], 2)
+        zoom_matrix = np.array([[zx, 0, 0],
+                                [0, zy, 0],
+                                [0, 0, 1]])
+
+        transform_matrix = np.dot(np.dot(np.dot(rotation_matrix, translation_matrix), shear_matrix), zoom_matrix)
+        h, w = x.shape[img_row_index], x.shape[img_col_index]
+        transform_matrix = self.transform_matrix_offset_center(transform_matrix, h, w)
+        x = self.apply_transform(x, transform_matrix, img_channel_index,
+                            fill_mode=fill_mode, cval=cval)
+        if blur_range != 0.:
+            x = ndimage.gaussian_filter(x, sigma=np.random.uniform(0.,blur_range))
+
+        if channel_shift_range != 0:
+            x = self.random_channel_shift(x, channel_shift_range, img_channel_index)
+
+        if horizontal_flip:
+            if np.random.random() < 0.5:
+                x = self.flip_axis(x, img_col_index)
+
+        if vertical_flip:
+            if np.random.random() < 0.5:
+                x = self.flip_axis(x, img_row_index)
+
+	return x
 
 class DriverTestSplit(TrainSplit):
 
@@ -3223,7 +3544,6 @@ class DriverTestSplit(TrainSplit):
                 else:
                         X_cv = X_valid.reshape(-1,1,np.size(X_cv,1),np.size(X_cv.X,2)).astype(float16)
 
-
 		if self.regression is True:			
 	                y_cv = np.zeros(shape=(np.size(y_target),self.n_classes))
         	        for i in range(0,self.n_classes):
@@ -3245,6 +3565,88 @@ class DriverTestSplit(TrainSplit):
         	return {k: v[sl] for k, v in arr.items()}
     	else:
         	return arr[sl]
+
+class DriverTrainTestSplit(TrainSplit):
+
+    def __init__(self, regression=False, max_train_split=25000, max_test_split=2000, grayscale=False, cache_dir="", n_classes=10):
+	self.max_test_split = max_test_split
+        self.max_train_split = max_train_split
+	self.cache_dir = cache_dir
+	self.grayscale = grayscale
+	self.n_classes = n_classes
+	self.regression = regression
+
+    def __call__(self, X, y, net):
+
+	print("Info: Splitting train-test data")
+	X_train = list()
+	y_train = list()
+
+	X_valid = list()
+	y_valid = list()
+
+        cache_chunks = list(glob.iglob(self.cache_dir + "/val_data_inputs*cache.npy"))
+
+        for cache_chunk in cache_chunks:
+                # load numpy input/target
+                cache_target = re.sub(r'val_data_inputs','val_data_targets',cache_chunk)
+                X_cv = np.load(cache_chunk)
+                y_target = np.load(cache_target).astype(float32)
+
+                # manipulate matrices so that it fits standard criteria
+                if self.grayscale is False:
+                        X_cv = X_cv.reshape(-1,3,np.size(X_cv,2),np.size(X_cv,3)).astype(float16)
+                else:
+                        X_cv = X_valid.reshape(-1,1,np.size(X_cv,1),np.size(X_cv.X,2)).astype(float16)
+
+		if self.regression is True:			
+	                y_cv = np.zeros(shape=(np.size(y_target),self.n_classes))
+        	        for i in range(0,self.n_classes):
+                        	y_cv[y_target == i,i] = 1.00
+                	y_cv = y_cv.astype(float16)
+		else:
+			y_cv = y_target.astype(int32)
+
+		for i in range(len(y_cv)):
+			X_valid.append(X_cv[i])
+			y_valid.append(y_cv[i])
+
+        cache_chunks = list(glob.iglob(self.cache_dir + "/train_data_inputs*cache.npy"))
+
+        for cache_chunk in cache_chunks:
+                # load numpy input/target
+                cache_target = re.sub(r'train_data_inputs','train_data_targets',cache_chunk)
+                X = np.load(cache_chunk)
+                y_target = np.load(cache_target).astype(float32)
+
+                # manipulate matrices so that it fits standard criteria
+                if self.grayscale is False:
+                        X = X.reshape(-1,3,np.size(X,2),np.size(X,3)).astype(float16)
+                else:
+                        X = X.reshape(-1,1,np.size(X,1),np.size(X,2)).astype(float16)
+
+		if self.regression is True:			
+	                y = np.zeros(shape=(np.size(y_target),self.n_classes))
+        	        for i in range(0,self.n_classes):
+                        	y[y_target == i,i] = 1.00
+                	y = y.astype(float16)
+		else:
+			y = y_target.astype(int32)
+
+		for i in range(len(y)):
+			X_train.append(X[i])
+			y_train.append(y[i])
+
+	print("Info: Total valid cnt = {}".format(len(X_valid)))
+	print("Info: Total train cnt = {}".format(len(X_train)))
+        return X_train, X_valid, y_train, y_valid
+
+    def _sldict(self,arr, sl):
+    	if isinstance(arr, dict):
+        	return {k: v[sl] for k, v in arr.items()}
+    	else:
+        	return arr[sl]
+
 
 class EarlyStopping(object):
     def __init__(self, patience=100):
